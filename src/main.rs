@@ -1,5 +1,3 @@
-use std::sync::mpsc::sync_channel;
-
 use cassandra_cpp::{Cluster, LendingIterator};
 use nu_plugin::{serve_plugin, MsgPackSerializer, Plugin, PluginCommand};
 use nu_plugin::{EngineInterface, EvaluatedCall};
@@ -44,14 +42,21 @@ impl PluginCommand for CassandraQuery {
             .named(
                 "host",
                 SyntaxShape::String,
-                "Hostname to connect to",
+                "Hostname(s) to connect to (comma separated, default: 127.0.0.1)",
                 Some('H'),
             )
+            .named("port", SyntaxShape::Int, "Port to connect to", Some('P'))
             .named(
                 "page-size",
                 SyntaxShape::Int,
-                "Page size to use for paging",
+                "Page size to use for paging (default: 512)",
                 Some('p'),
+            )
+            .named(
+                "local-address",
+                SyntaxShape::String,
+                "Local address to advertise (default: 127.0.0.1)",
+                Some('L'),
             )
             .category(Category::Database)
     }
@@ -61,11 +66,18 @@ impl PluginCommand for CassandraQuery {
     }
 
     fn examples(&self) -> Vec<Example> {
-        vec![Example {
-            example: "cassandra-query `SELECT keyspace_name FROM system_schema.keyspaces`",
-            description: "Get list of keyspaces",
-            result: None,
-        }]
+        vec![
+            Example {
+                example: "cassandra-query `SELECT keyspace_name FROM system_schema.keyspaces`",
+                description: "Get list of keyspaces",
+                result: None,
+            },
+            Example {
+                example: "cassandra-query `SELECT * FROM system_schema.tables`",
+                description: "Get list of tables",
+                result: None,
+            },
+        ]
     }
 
     fn run(
@@ -83,19 +95,32 @@ async fn run(call: &EvaluatedCall) -> Result<PipelineData, LabeledError> {
     let span = call.head;
     let query: String = call.req(0)?;
     let host: String = call.get_flag("host")?.unwrap_or_else(|| "127.0.0.1".into());
+    let local_address: String = call
+        .get_flag("local-address")?
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let port: Option<u16> = call.get_flag("port")?;
     let page_size: i32 = call.get_flag("page-size")?.unwrap_or(512);
+
     let mut cluster = Cluster::default();
     cluster.set_contact_points(&host).label(span)?;
-    cluster.set_load_balance_round_robin();
+    cluster.set_local_address(&local_address).label(span)?;
+    if let Some(port) = port {
+        cluster.set_port(port).label(span)?;
+    }
+
     let session = cluster.connect().await.label(span)?;
+
     let mut statement = session.statement(&query);
     statement.set_paging_size(page_size).label(span)?;
+
+    // First page
     let mut result = session
         .execute_with_payloads(&statement)
         .await
         .label(span)?
         .0;
-    let (tx, rx) = sync_channel(1024);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(page_size as usize * 2);
 
     let columns = (0..result.column_count())
         .map(|idx| result.column_name(idx as usize).map(|s| s.to_owned()))
@@ -104,6 +129,7 @@ async fn run(call: &EvaluatedCall) -> Result<PipelineData, LabeledError> {
 
     tokio::spawn(async move {
         loop {
+            // Get and convert the results from the page to Nushell values
             let mut iter = result.iter();
             while let Some(row) = iter.next() {
                 let mut record = Record::with_capacity(columns.len());
@@ -115,10 +141,11 @@ async fn run(call: &EvaluatedCall) -> Result<PipelineData, LabeledError> {
                         .unwrap_or_else(|err| Value::error(err.into(), span));
                     record.insert(col, nu_val);
                 }
-                if tx.send(Value::record(record, span)).is_err() {
+                if tx.send(Value::record(record, span)).await.is_err() {
                     break;
                 }
             }
+            // When the page is empty, try to get another
             if let Ok(Some(token)) = result.paging_state_token() {
                 if let Err(err) = statement.set_paging_state_token(&token) {
                     let _ = tx.send(Value::error(err.label(span).into(), span));
@@ -142,7 +169,11 @@ async fn run(call: &EvaluatedCall) -> Result<PipelineData, LabeledError> {
         drop(cluster);
     });
     Ok(PipelineData::ListStream(
-        ListStream::new(rx.into_iter(), span, Signals::empty()),
+        ListStream::new(
+            std::iter::from_fn(move || rx.blocking_recv()),
+            span,
+            Signals::empty(),
+        ),
         None,
     ))
 }
@@ -268,6 +299,10 @@ where
 }
 
 fn main() {
+    cassandra_cpp::set_level(cassandra_cpp::LogLevel::ERROR);
+
+    // We put the tokio runtime on the main thread, and have it spawn a blocking thread for the
+    // plugin server. Plugin calls then spawn futures to run on the tokio executor.
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

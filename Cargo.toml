@@ -3,7 +3,7 @@ name = "nu_plugin_cassandra_query"
 version = "0.1.0"
 authors = ["Devyn Cairns <devyn.cairns@gmail.com>"]
 edition = "2021"
-description = "a nushell plugin called cassandra_query"
+description = "Query plugin for the Cassandra database for Nushell"
 repository = "https://github.com/devyn/nu_plugin_cassandra_query"
 license = "MIT"
 
@@ -16,7 +16,7 @@ license = "MIT"
 nu-plugin = "0.99.0"
 nu-protocol = { version = "0.99.0", features = ["plugin"] }
 cassandra-cpp = "3.0"
-tokio = { version = "1.0", features = ["rt", "macros"] }
+tokio = { version = "1.0", features = ["rt", "macros", "sync"] }
 chrono = "0.4"
 uuid = "1.11.0"
 
