@@ -74,31 +74,56 @@ async fn run(call: &EvaluatedCall) -> Result<PipelineData, LabeledError> {
     cluster.set_contact_points("127.0.0.1").label(span)?;
     cluster.set_load_balance_round_robin();
     let session = cluster.connect().await.label(span)?;
-    let result = session.execute(&query).await.label(span)?;
+    let mut statement = session.statement(&query);
+    statement.set_paging_size(1024).label(span)?;
+    let mut result = session
+        .execute_with_payloads(&statement)
+        .await
+        .label(span)?
+        .0;
+    let (tx, rx) = sync_channel(1024);
 
     let columns = (0..result.column_count())
         .map(|idx| result.column_name(idx as usize).map(|s| s.to_owned()))
         .collect::<Result<Vec<String>, _>>()
         .label(span)?;
 
-    let (tx, rx) = sync_channel(1024);
     tokio::spawn(async move {
-        let mut iter = result.iter();
-        while let Some(row) = iter.next() {
-            let mut record = Record::with_capacity(columns.len());
-            for (idx, col) in columns.iter().enumerate() {
-                let nu_val = row
-                    .get_column(idx)
-                    .label(span)
-                    .map(|val| get_cassandra_value(val, span))
-                    .unwrap_or_else(|err| Value::error(err.into(), span));
-                record.insert(col, nu_val);
+        loop {
+            let mut iter = result.iter();
+            while let Some(row) = iter.next() {
+                let mut record = Record::with_capacity(columns.len());
+                for (idx, col) in columns.iter().enumerate() {
+                    let nu_val = row
+                        .get_column(idx)
+                        .label(span)
+                        .map(|val| get_cassandra_value(val, span))
+                        .unwrap_or_else(|err| Value::error(err.into(), span));
+                    record.insert(col, nu_val);
+                }
+                if tx.send(Value::record(record, span)).is_err() {
+                    break;
+                }
             }
-            if tx.send(Value::record(record, span)).is_err() {
+            if let Ok(Some(token)) = result.paging_state_token() {
+                if let Err(err) = statement.set_paging_state_token(&token) {
+                    let _ = tx.send(Value::error(err.label(span).into(), span));
+                    break;
+                }
+                match session.execute_with_payloads(&statement).await.label(span) {
+                    Ok((next_result, _)) => {
+                        drop(iter);
+                        result = next_result;
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Value::error(err.into(), span));
+                        break;
+                    }
+                }
+            } else {
                 break;
             }
         }
-        drop(iter);
         drop(session);
         drop(cluster);
     });
