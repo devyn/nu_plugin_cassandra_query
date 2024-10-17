@@ -7,6 +7,9 @@ I wrote this plugin mostly to make working with Cassandra for local development 
 ## Installing
 
 ```nushell
+# From crates.io
+> cargo install nu_plugin_cassandra_query
+# or from this repository
 > cargo install --path .
 ```
 
