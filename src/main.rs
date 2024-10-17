@@ -83,7 +83,7 @@ async fn run(call: &EvaluatedCall) -> Result<PipelineData, LabeledError> {
     let span = call.head;
     let query: String = call.req(0)?;
     let host: String = call.get_flag("host")?.unwrap_or_else(|| "127.0.0.1".into());
-    let page_size: i32 = call.get_flag("page-size")?.unwrap_or(1024);
+    let page_size: i32 = call.get_flag("page-size")?.unwrap_or(512);
     let mut cluster = Cluster::default();
     cluster.set_contact_points(&host).label(span)?;
     cluster.set_load_balance_round_robin();
