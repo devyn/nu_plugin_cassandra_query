@@ -41,6 +41,18 @@ impl PluginCommand for CassandraQuery {
         Signature::build(self.name())
             .input_output_type(Type::Nothing, Type::table())
             .required("query", SyntaxShape::String, "CQL query to run")
+            .named(
+                "host",
+                SyntaxShape::String,
+                "Hostname to connect to",
+                Some('H'),
+            )
+            .named(
+                "page-size",
+                SyntaxShape::Int,
+                "Page size to use for paging",
+                Some('p'),
+            )
             .category(Category::Database)
     }
 
@@ -70,12 +82,14 @@ impl PluginCommand for CassandraQuery {
 async fn run(call: &EvaluatedCall) -> Result<PipelineData, LabeledError> {
     let span = call.head;
     let query: String = call.req(0)?;
+    let host: String = call.get_flag("host")?.unwrap_or_else(|| "127.0.0.1".into());
+    let page_size: i32 = call.get_flag("page-size")?.unwrap_or(1024);
     let mut cluster = Cluster::default();
-    cluster.set_contact_points("127.0.0.1").label(span)?;
+    cluster.set_contact_points(&host).label(span)?;
     cluster.set_load_balance_round_robin();
     let session = cluster.connect().await.label(span)?;
     let mut statement = session.statement(&query);
-    statement.set_paging_size(1024).label(span)?;
+    statement.set_paging_size(page_size).label(span)?;
     let mut result = session
         .execute_with_payloads(&statement)
         .await
